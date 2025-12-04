@@ -3,6 +3,7 @@ package com.example.mili
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -36,23 +37,23 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp // Agregado para compatibilidad
+import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.navigation.NavController
-import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import coil.compose.AsyncImage
-import com.example.mili.ui.theme.MiliTheme
-import com.google.ai.client.generativeai.type.content
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
@@ -61,21 +62,23 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+// ================= CONSTANTES Y COLORES =================
 private object Constants {
-    const val DATASTORE_NAME = "publications"
+    const val DATASTORE_NAME = "milenium_db"
     const val PUBLICATIONS_KEY = "publications_list"
-    const val USERS_KEY = "users_data"
-    const val IMAGE_HEIGHT = 200
-    const val DEFAULT_PADDING = 16
-    const val MEDIUM_SPACING = 16
-    const val LARGE_SPACING = 23
-    const val SMALL_SPACING = 8
+    const val DARK_MODE_KEY = "dark_mode_enabled"
 }
 
-// Inicialización del DataStore (Memoria de la app)
+// Tus colores personalizados
+val PurplePrimary = Color(0xFF5F4776)
+val PurpleDark = Color(0xFF3B2C4A)
+val PurpleLight = Color(0xFFD5C3FB)
+val Whiteish = Color(0xFFFDFDFD)
+
+// Inicialización del DataStore
 private val Context.dataStore by preferencesDataStore(Constants.DATASTORE_NAME)
 
-// ================= MODELOS DE DATOS (NUEVOS) =================
+// ================= MODELOS DE DATOS =================
 @Serializable
 data class Publication(
     val titulo: String,
@@ -90,12 +93,8 @@ data class Publication(
 data class User(
     val id: Int,
     val nombre: String,
-    val edad: Int,
     val profesion: String,
-    val descripcion: String,
-    val imagenUrl: String? = null,
-    val intereses: List<String> = emptyList(),
-    val timestamp: Long = System.currentTimeMillis()
+    val intereses: List<String> = emptyList()
 )
 
 @Serializable
@@ -104,38 +103,51 @@ data class SearchResult(
     val users: List<User>
 )
 
-// ================= REPOSITORIOS (LÓGICA) =================
+// ================= REPOSITORIOS =================
+
+// 1. Repositorio de Configuración (Modo Oscuro Global)
+class SettingsRepository(private val context: Context) {
+    private val darkModeKey = booleanPreferencesKey(Constants.DARK_MODE_KEY)
+
+    val isDarkMode: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[darkModeKey] ?: false
+    }
+
+    suspend fun setDarkMode(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[darkModeKey] = enabled
+        }
+    }
+}
+
+// 2. Repositorio de Publicaciones
 class PublicationRepository(private val context: Context) {
     private val publicationsKey = stringPreferencesKey(Constants.PUBLICATIONS_KEY)
 
     suspend fun savePublication(publication: Publication) {
         val currentList = getAllPublicationsList()
-        val updatedList = listOf(publication) + currentList // Nuevo al principio
+        val updatedList = listOf(publication) + currentList
         context.dataStore.edit { preferences ->
             preferences[publicationsKey] = Json.encodeToString(updatedList)
         }
     }
 
-    suspend fun updatePublicationLike(publicationId: Long, isLiked: Boolean) {
+    suspend fun updatePublicationLike(timestamp: Long, isLiked: Boolean) {
         val currentList = getAllPublicationsList()
-        val updatedList = currentList.map { publication ->
-            if (publication.timestamp == publicationId) {
-                publication.copy(
-                    likes = if (isLiked) publication.likes + 1 else maxOf(0, publication.likes - 1),
-                    isLiked = isLiked
-                )
-            } else {
-                publication
-            }
+        val updatedList = currentList.map {
+            if (it.timestamp == timestamp) it.copy(
+                likes = if (isLiked) it.likes + 1 else maxOf(0, it.likes - 1),
+                isLiked = isLiked
+            ) else it
         }
         context.dataStore.edit { preferences ->
             preferences[publicationsKey] = Json.encodeToString(updatedList)
         }
     }
 
-    suspend fun deletePublication(publicationToDelete: Publication) {
+    suspend fun deletePublication(publication: Publication) {
         val currentList = getAllPublicationsList()
-        val updatedList = currentList.filterNot { it.timestamp == publicationToDelete.timestamp }
+        val updatedList = currentList.filterNot { it.timestamp == publication.timestamp }
         context.dataStore.edit { preferences ->
             preferences[publicationsKey] = Json.encodeToString(updatedList)
         }
@@ -143,23 +155,19 @@ class PublicationRepository(private val context: Context) {
 
     fun getAllPublications(): Flow<List<Publication>> {
         return context.dataStore.data.map { preferences ->
-            val jsonString = preferences[publicationsKey] ?: "[]"
-            try {
-                Json.decodeFromString<List<Publication>>(jsonString)
-            } catch (e: Exception) { emptyList() }
+            val json = preferences[publicationsKey] ?: "[]"
+            try { Json.decodeFromString(json) } catch (e: Exception) { emptyList() }
         }
     }
 
     private suspend fun getAllPublicationsList(): List<Publication> {
         val preferences = context.dataStore.data.first()
-        val jsonString = preferences[publicationsKey] ?: "[]"
-        return try {
-            Json.decodeFromString(jsonString)
-        } catch (e: Exception) { emptyList() }
+        val json = preferences[publicationsKey] ?: "[]"
+        return try { Json.decodeFromString(json) } catch (e: Exception) { emptyList() }
     }
 
     suspend fun searchAllContent(query: String, publications: List<Publication>): SearchResult {
-        val userRepository = UserRepository(context)
+        val userRepository = UserRepository()
         val filteredPubs = if (query.isBlank()) publications else publications.filter {
             it.titulo.contains(query, ignoreCase = true) || it.descripcion.contains(query, ignoreCase = true)
         }
@@ -168,568 +176,125 @@ class PublicationRepository(private val context: Context) {
     }
 }
 
-class UserRepository(private val context: Context) {
-    // Lista de usuarios "quemados" para que la búsqueda no esté vacía
+// 3. Repositorio de Usuarios (Falsos)
+class UserRepository {
     private val defaultUsers = listOf(
-        User(1, "María González", 25, "Diseñadora UX", "Amante del diseño.", intereses = listOf("Diseño", "Arte")),
-        User(2, "Carlos Rodríguez", 32, "Dev Android", "Código y café.", intereses = listOf("Programación", "Kotlin")),
-        User(3, "Ana López", 28, "Ingeniera", "Backend expert.", intereses = listOf("Java", "Sistemas"))
+        User(1, "María González", "Diseñadora UX", listOf("Diseño", "Arte")),
+        User(2, "Carlos Rodríguez", "Dev Android", listOf("Programación", "Kotlin")),
+        User(3, "Ana López", "Ingeniera", listOf("Java", "Sistemas"))
     )
-    suspend fun searchUsers(query: String): List<User> {
+    fun searchUsers(query: String): List<User> {
         if (query.isBlank()) return emptyList()
-        return defaultUsers.filter { user ->
-            user.nombre.contains(query, ignoreCase = true) || user.profesion.contains(query, ignoreCase = true)
+        return defaultUsers.filter {
+            it.nombre.contains(query, ignoreCase = true) || it.profesion.contains(query, ignoreCase = true)
         }
     }
-    suspend fun getUserById(id: Int): User? = defaultUsers.find { it.id == id }
 }
 
+// 4. Gestor de Imágenes (Cámara y Galería)
 class ImageManager(private val context: Context) {
-    fun createImageFile(): File {
+    // Crea un archivo temporal vacío para que la cámara guarde la foto ahí
+    fun createTempImageFile(): File {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val storageDir = File(context.filesDir, "publication_images")
         if (!storageDir.exists()) storageDir.mkdirs()
-        return File(storageDir, "publication_${timeStamp}.jpg")
+        return File(storageDir, "IMG_${timeStamp}.jpg")
     }
-    fun getPersistentUri(file: File): Uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-    fun getDisplayableUri(uriString: String?): Uri? = uriString?.let { Uri.parse(it) }
 
-    fun copyUriToPersistentFile(temporaryUri: Uri): Uri? {
-        return try {
-            val persistentFile = createImageFile()
-            context.contentResolver.openInputStream(temporaryUri)?.use { input ->
-                persistentFile.outputStream().use { output -> input.copyTo(output) }
+    // Obtiene la URI segura para la cámara (requiere FileProvider en Manifest)
+    fun getUriForFile(file: File): Uri {
+        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    }
+
+    // Copia la imagen de la galería a nuestra carpeta privada (corrige el error de que no se adjuntaba)
+    suspend fun copyUriToPersistentFile(sourceUri: Uri): Uri? = withContext(Dispatchers.IO) {
+        try {
+            val destFile = createTempImageFile()
+            context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                destFile.outputStream().use { output -> input.copyTo(output) }
             }
-            getPersistentUri(persistentFile)
-        } catch (e: Exception) { null }
+            getUriForFile(destFile)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
+
+    fun getDisplayableUri(uriString: String?): Uri? = uriString?.let { Uri.parse(it) }
 }
 
-// Utilidad de fecha
-private fun formatDate(timestamp: Long): String {
-    val sdf = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
-    return sdf.format(Date(timestamp))
-}
+// ================= MAIN ACTIVITY Y TEMA GLOBAL =================
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MiliTheme {
-                AppNavegacion()
+            // Leemos la configuración global del modo oscuro
+            val settingsRepo = remember { SettingsRepository(applicationContext) }
+            val isDarkMode by settingsRepo.isDarkMode.collectAsState(initial = false)
+
+            // Definimos el tema basado en tu paleta de colores
+            val colorScheme = if (isDarkMode) {
+                darkColorScheme(
+                    primary = PurpleLight,
+                    onPrimary = PurpleDark,
+                    secondary = PurplePrimary,
+                    background = PurpleDark,
+                    surface = Color(0xFF2D2238), // Un poco más claro que el fondo
+                    onSurface = Whiteish
+                )
+            } else {
+                lightColorScheme(
+                    primary = PurplePrimary,
+                    onPrimary = Color.White,
+                    secondary = PurpleLight,
+                    background = Color(0xFFF5F0FF), // Lila muy clarito de fondo
+                    surface = Color.White,
+                    onSurface = PurpleDark
+                )
+            }
+
+            MaterialTheme(colorScheme = colorScheme) {
+                // Pasamos el repositorio de settings para poder cambiar el tema desde Configuración
+                AppNavegacion(settingsRepo)
             }
         }
     }
 }
 
+// ================= NAVEGACIÓN PRINCIPAL =================
 @Composable
-fun AppNavegacion() {
+fun AppNavegacion(settingsRepo: SettingsRepository) {
     val navController = rememberNavController()
 
-    NavHost(
-        navController = navController,
-        startDestination = "inicio"
-    ) {
-        // 1. EL INICIO AHORA ES EL FEED REAL (PantallaPublicaciones)
-        composable("inicio") {
-            PantallaPublicaciones(navController)
-        }
+    NavHost(navController = navController, startDestination = "inicio") {
+        composable("inicio") { PantallaPublicaciones(navController) }
 
-        // 2. PANTALLAS REALES (Ya no usamos PantallaBlanca)
         composable("busqueda") {
             SearchScreen(onNavigateBack = { navController.popBackStack() })
         }
 
         composable("nueva_post") {
-            CreateScreen(
-                navController = navController, // Pasamos el controller
-                onNavigateBack = { navController.popBackStack() }
-            )
+            CreateScreen(navController = navController, onNavigateBack = { navController.popBackStack() })
         }
 
-        // 3. PANTALLAS SECUNDARIAS
-        composable("perfil") {
-            SimpleProfileScreen(onBack = { navController.popBackStack() })
-        }
-        composable("notificaciones") {
-            NotificationScreenStyle(onBack = { navController.popBackStack() })
-        }
-        composable("configuracion") { ConfiguracionScreen(navController) }
+        composable("perfil") { SimpleProfileScreen(onBack = { navController.popBackStack() }) }
+        composable("notificaciones") { NotificationScreenStyle(onBack = { navController.popBackStack() }) }
+
+        // Pasamos el repositorio a configuración para que el switch funcione
+        composable("configuracion") { ConfiguracionScreen(navController, settingsRepo) }
+
         composable("contactanos") { ContactanosScreen(navController) }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun ConfiguracionScreen(navController: NavController) {
-    // Nota: Estos estados son locales. Al salir de la pantalla se reinician.
-    // Para que persistan en toda la app, necesitaríamos una base de datos o ViewModel.
-    var notificationsEnabled by remember { mutableStateOf(true) }
-    var isDarkMode by remember { mutableStateOf(false) }
-    var selectedLanguage by remember { mutableStateOf("Español") }
-
-    // Este tema solo aplica a ESTA pantalla (efecto visual local)
-    val currentTheme = if (isDarkMode) darkColorScheme() else lightColorScheme()
-
-    MaterialTheme(colorScheme = currentTheme) {
-        Scaffold(
-            topBar = {
-                CenterAlignedTopAppBar(
-                    title = { Text("Configuración") },
-                    navigationIcon = {
-                        IconButton(onClick = { navController.popBackStack() }) {
-                            Icon(Icons.Filled.ArrowBack, "Volver")
-                        }
-                    },
-                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                        // Puedes ajustar estos colores a tu gusto o usar los del tema
-                        containerColor = Color.LightGray.copy(alpha = 0.5f)
-                    )
-                )
-            }
-        ) { innerPadding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .padding(16.dp)
-                    .background(MaterialTheme.colorScheme.background) // Se adapta al modo oscuro/claro
-            ) {
-
-                // NOTIFICACIONES
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("Notificaciones", style = MaterialTheme.typography.bodyLarge)
-                    Spacer(Modifier.weight(1f))
-                    Switch(checked = notificationsEnabled, onCheckedChange = { notificationsEnabled = it })
-                }
-
-                // MODO OSCURO
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("Modo Oscuro", style = MaterialTheme.typography.bodyLarge)
-                    Spacer(Modifier.weight(1f))
-                    Switch(checked = isDarkMode, onCheckedChange = { isDarkMode = it })
-                }
-
-                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
-                // IDIOMA
-                Text("Idioma", style = MaterialTheme.typography.bodyLarge)
-                Spacer(Modifier.height(8.dp))
-
-                var expanded by remember { mutableStateOf(false) }
-
-                ExposedDropdownMenuBox(
-                    expanded = expanded,
-                    onExpandedChange = { expanded = !expanded }
-                ) {
-                    TextField(
-                        readOnly = true,
-                        value = selectedLanguage,
-                        onValueChange = { },
-                        label = { Text("Seleccionar idioma") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                        colors = ExposedDropdownMenuDefaults.textFieldColors(),
-                        modifier = Modifier.menuAnchor().fillMaxWidth()
-                    )
-                    ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                        listOf("Español", "English").forEach { lang ->
-                            DropdownMenuItem(
-                                text = { Text(lang) },
-                                onClick = {
-                                    selectedLanguage = lang
-                                    expanded = false
-                                }
-                            )
-                        }
-                    }
-                }
-
-                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
-
-                Spacer(Modifier.height(32.dp))
-            }
-        }
-    }
-}
-
-// ==================== PANTALLA CONTÁCTANOS ====================
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun ContactanosScreen(navController: NavController) {
-    Scaffold(
-        topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("Contáctanos", color = Color.Black) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = "Volver", tint = Color.Black)
-                    }
-                },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                    containerColor = Color.LightGray.copy(alpha = 0.5f)
-                )
-            )
-        },
-        containerColor = Color.White
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(16.dp)
-                .background(Color.White),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            ContactItem(
-                icon = Icons.Filled.Phone,
-                text = "01 (238) 688 31 32",
-                onClick = { /* Acción al llamar */ }
-            )
-            ContactItem(
-                icon = Icons.Filled.CheckCircle,
-                text = "01 (238) 104 80 04",
-                onClick = { }
-            )
-            ContactItem(
-                icon = Icons.Filled.LocationOn,
-                text = "Reforma Norte #444 Col. Centro\nC.P. 75700",
-                onClick = { }
-            )
-            ContactItem(
-                icon = Icons.Filled.Email,
-                text = "admisiones@unimilenium.edu.mx",
-                onClick = { }
-            )
-            ContactItem(
-                icon = Icons.Filled.Face,
-                text = "Centro Universitario Milenium",
-                onClick = { }
-            )
-            ContactItem(
-                icon = Icons.Filled.Clear,
-                text = "unimilenium",
-                onClick = { }
-            )
-        }
-    }
-}
-
-@Composable
-fun ContactItem(icon: ImageVector, text: String, onClick: () -> Unit) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onClick() }
-            .padding(vertical = 8.dp)
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = Color.Gray,
-            modifier = Modifier.size(32.dp)
-        )
-        Spacer(Modifier.width(16.dp))
-        Text(
-            text = text,
-            style = MaterialTheme.typography.bodyLarge,
-            color = Color.DarkGray
-        )
-    }
-}
-
-// ==================== PANTALLA DE PERFIL (CORREGIDA) ====================
-@Composable
-fun SimpleProfileScreen(onBack: () -> Unit) {
-    // 1. Adaptamos los datos falsos a la NUEVA estructura (titulo, descripcion...)
-    val publications = remember {
-        mutableStateListOf(
-            Publication(
-                titulo = "Un día increíble", // Usamos Título
-                descripcion = "Buen trabajo Pedro! Sigue trabajando en eso!", // Usamos Descripción
-                timestamp = System.currentTimeMillis() - 7200000 // Hace 2 horas aprox
-            ),
-            Publication(
-                titulo = "Repost",
-                descripcion = "Texto de ejemplo xd",
-                timestamp = System.currentTimeMillis() - 10800000 // Hace 3 horas aprox
-            )
-        )
-    }
-
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.White),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        // Cabecera del Perfil (Se mantiene igual visualmente)
-        item {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(
-                        brush = Brush.verticalGradient(
-                            colors = listOf(
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
-                                MaterialTheme.colorScheme.surface
-                            )
-                        )
-                    )
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Filled.ArrowBack, "Atrás", tint = Color.Black)
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Rafael", fontWeight = FontWeight.Bold, fontSize = 32.sp, color = Color.Black)
-                            Text("Pantera Osorio", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color.DarkGray)
-                            Text(
-                                "Ing. Sistemas Informáticos e\nInteligencia Artificial",
-                                fontSize = 14.sp,
-                                color = Color.DarkGray,
-                                lineHeight = 18.sp,
-                                modifier = Modifier.padding(vertical = 4.dp)
-                            )
-                        }
-
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(start = 16.dp)) {
-                            Surface(modifier = Modifier.size(100.dp), shape = CircleShape, color = Color(0xFFEEEEEE), border = BorderStroke(2.dp, Color.LightGray)) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(Icons.Filled.AccountCircle, null, modifier = Modifier.size(80.dp), tint = Color.Gray)
-                                }
-                            }
-                            Text("2", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                            Text("Posts", fontSize = 12.sp, color = Color.DarkGray)
-                        }
-                    }
-                }
-            }
-        }
-
-        item {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Spacer(modifier = Modifier.height(10.dp))
-                Text("BIOGRAFIA", Modifier.align(Alignment.CenterHorizontally), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
-                Spacer(modifier = Modifier.height(10.dp))
-                Divider(color = Color.LightGray, thickness = 1.dp)
-            }
-        }
-
-        // 2. Usamos la tarjeta NUEVA (PublicationCardModern) que ya está adaptada
-        items(publications) { publication ->
-            PublicationCardModern(
-                publication = publication,
-                onDelete = { publications.remove(publication) },
-                onLike = { liked ->
-                    val index = publications.indexOf(publication)
-                    if (index != -1) {
-                        publications[index] = publication.copy(isLiked = liked)
-                    }
-                }
-            )
-        }
-    }
-}
-
-// =======================================
-// ========= TARJETA UNIVERSAL ===========
-// =======================================
-@Composable
-fun PublicationCardModern(
-    publication: Publication,
-    onDelete: () -> Unit,
-    onLike: (Boolean) -> Unit
-) {
-    val context = LocalContext.current
-    val imageManager = remember { ImageManager(context) }
-
-    // Convertimos la ruta de la imagen guardada en algo que se pueda ver
-    val displayUri = remember(publication.imageUri) {
-        imageManager.getDisplayableUri(publication.imageUri)
-    }
-
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        elevation = CardDefaults.cardElevation(4.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Column(Modifier.padding(16.dp)) {
-            // Cabecera (Usuario ficticio + Fecha)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    modifier = Modifier.size(40.dp),
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text("U", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                    }
-                }
-                Spacer(Modifier.width(8.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("Usuario", fontWeight = FontWeight.Bold)
-                    Text(formatDate(publication.timestamp), fontSize = 12.sp, color = Color.Gray)
-                }
-                // Menú de borrar
-                IconButton(onClick = onDelete) {
-                    Icon(Icons.Filled.Delete, "Borrar", tint = Color.Gray)
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            // Título y Descripción (Lo nuevo)
-            Text(publication.titulo, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-            Text(publication.descripcion, fontSize = 14.sp)
-
-            // Imagen (Si existe)
-            displayUri?.let {
-                Spacer(Modifier.height(8.dp))
-                AsyncImage(
-                    model = it,
-                    contentDescription = null,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(200.dp)
-                        .clip(RoundedCornerShape(8.dp)),
-                    contentScale = ContentScale.Crop
-                )
-            }
-
-            // Botón de Like
-            Row(Modifier.padding(top = 16.dp)) {
-                Icon(
-                    if (publication.isLiked) Icons.Filled.Favorite else Icons.Outlined.Favorite,
-                    contentDescription = "Like",
-                    tint = if (publication.isLiked) Color.Red else Color.Gray,
-                    modifier = Modifier.clickable { onLike(!publication.isLiked) }
-                )
-                Spacer(Modifier.width(4.dp))
-                Text("${publication.likes}")
-            }
-        }
-    }
-}
-
-// ==================== PANTALLA DE NOTIFICACIONES ====================
-@Composable
-fun NotificationScreenStyle(onBack: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.White)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = "Atrás", tint = Color.Black)
-            }
-
-            Text(
-                text = "Notificaciones",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.Black
-            )
-            Icon(Icons.Filled.Search, contentDescription = "Buscar", tint = Color.Black)
-        }
-
-        LazyColumn(
-            modifier = Modifier.weight(1f)
-        ) {
-            items(3) { index ->
-                NotificationItemStyle(index)
-            }
-        }
-    }
-}
-
-@Composable
-fun NotificationItemStyle(index: Int) {
-    val names = listOf("Pedro", "Pedro", "Willmar")
-    val actions = listOf("Le dio me gusta", "Le dio me gusta", "@ Te mencionó")
-    val times = listOf("5 mins", "5 mins", "1 hr")
-    val isLike = index < 2
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            imageVector = Icons.Filled.AccountCircle,
-            contentDescription = null,
-            modifier = Modifier.size(50.dp),
-            tint = Color.LightGray
-        )
-
-        Spacer(modifier = Modifier.width(16.dp))
-
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = names.getOrElse(index) { "Usuario" },
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp,
-                color = Color.Black
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (isLike) {
-                    Icon(
-                        imageVector = Icons.Filled.Favorite,
-                        contentDescription = null,
-                        tint = Color(0xFF5F4776),
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                }
-                Text(
-                    text = actions.getOrElse(index) { "" },
-                    color = Color.DarkGray,
-                    fontSize = 14.sp
-                )
-            }
-        }
-
-        Text(
-            text = times.getOrElse(index) { "" },
-            color = Color.Gray,
-            fontSize = 12.sp
-        )
-    }
-    Divider(color = Color(0xFFF5F5F5), thickness = 1.dp)
-}
-// =======================================
-// ========= PANTALLA FEED (PRINCIPAL) ===
-// =======================================
-// =======================================
-// ========= PANTALLA FEED (CORREGIDA) ===
-// =======================================
+// ================= PANTALLA FEED (INICIO) =================
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PantallaPublicaciones(navController: NavController) {
     val context = LocalContext.current
     val repository = remember { PublicationRepository(context) }
     val publications by repository.getAllPublications().collectAsState(initial = emptyList())
-
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
@@ -737,9 +302,19 @@ fun PantallaPublicaciones(navController: NavController) {
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet {
-                Text("Menú", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(16.dp))
-                HorizontalDivider()
+                // Header del Drawer con color morado
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(30.dp),
+                        contentAlignment = Alignment.Center
 
+                )
+
+                {
+                    Text("Menú", color = PurplePrimary, fontWeight = FontWeight.Bold, fontSize = 24.sp)
+                }
+                Spacer(Modifier.height(20.dp))
                 NavigationDrawerItem(label = { Text("Inicio") }, selected = false, onClick = { scope.launch { drawerState.close() }; navController.navigate("inicio") })
                 NavigationDrawerItem(label = { Text("Perfil") }, selected = false, onClick = { scope.launch { drawerState.close() }; navController.navigate("perfil") })
                 NavigationDrawerItem(label = { Text("Notificaciones") }, selected = false, onClick = { scope.launch { drawerState.close() }; navController.navigate("notificaciones") })
@@ -751,44 +326,46 @@ fun PantallaPublicaciones(navController: NavController) {
         Scaffold(
             topBar = {
                 CenterAlignedTopAppBar(
-                    // 1. RECUPERAMOS TU LOGO (IMAGEN)
                     title = {
+                        // Tu logo recuperado
                         Image(
                             painter = painterResource(id = R.drawable.logo2),
-                            contentDescription = "Logo de la app",
-                            modifier = Modifier
-                                .size(60.dp)
-                                .clickable { navController.navigate("inicio") }
+                            contentDescription = "Logo",
+                            modifier = Modifier.size(50.dp).clickable { navController.navigate("inicio") }
                         )
                     },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Filled.Menu, "Menú")
+                            Icon(Icons.Filled.Menu, "Menú", tint = MaterialTheme.colorScheme.primary)
                         }
                     },
                     actions = {
                         IconButton(onClick = { navController.navigate("busqueda") }) {
-                            Icon(Icons.Filled.Search, "Buscar")
+                            Icon(Icons.Filled.Search, "Buscar", tint = MaterialTheme.colorScheme.primary)
                         }
                     }
                 )
             },
             floatingActionButton = {
-                FloatingActionButton(onClick = { navController.navigate("nueva_post") }) {
+                FloatingActionButton(
+                    onClick = { navController.navigate("nueva_post") },
+                    containerColor = PurplePrimary,
+                    contentColor = Color.White
+                ) {
                     Icon(Icons.Filled.Add, "Crear")
                 }
             },
-            // 2. RECUPERAMOS LA POSICIÓN CENTRAL DEL BOTÓN
             floatingActionButtonPosition = FabPosition.Center
-        ) { paddingValues ->
+        ) { padding ->
             if (publications.isEmpty()) {
-                Box(Modifier.fillMaxSize().padding(paddingValues), contentAlignment = Alignment.Center) {
-                    Text("No hay publicaciones aún.\n¡Sé el primero!", textAlign = TextAlign.Center, color = Color.Gray)
+                Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                    Text("No hay publicaciones.\n¡Sé el primero!", textAlign = TextAlign.Center, color = Color.Gray)
                 }
             } else {
                 LazyColumn(
-                    modifier = Modifier.fillMaxSize().padding(paddingValues),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    modifier = Modifier.fillMaxSize().padding(padding),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    contentPadding = PaddingValues(16.dp)
                 ) {
                     items(publications) { publication ->
                         PublicationCardModern(
@@ -803,9 +380,7 @@ fun PantallaPublicaciones(navController: NavController) {
     }
 }
 
-// =======================================
-// ========= PANTALLA CREAR POST =========
-// =======================================
+// ================= PANTALLA CREAR POST (CÁMARA + GALERÍA) =================
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CreateScreen(navController: NavController, onNavigateBack: () -> Unit) {
@@ -818,9 +393,25 @@ fun CreateScreen(navController: NavController, onNavigateBack: () -> Unit) {
     var descripcion by remember { mutableStateOf("") }
     var imageUri by remember { mutableStateOf<Uri?>(null) }
 
-    // Configuración para abrir la galería
+    // Estado para guardar la URI temporal de la foto que vamos a tomar
+    var tempCameraUri by remember { mutableStateOf<Uri?>(null) }
+
+    // 1. Launcher para Galería
     val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) imageUri = imageManager.copyUriToPersistentFile(uri)
+        if (uri != null) {
+            scope.launch {
+                val savedUri = imageManager.copyUriToPersistentFile(uri)
+                imageUri = savedUri // Actualizamos la imagen a mostrar
+            }
+        }
+    }
+
+    // 2. Launcher para Cámara
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+        if (success && tempCameraUri != null) {
+            // Si la foto se tomó bien, usamos la URI temporal que creamos antes
+            imageUri = tempCameraUri
+        }
     }
 
     Scaffold(
@@ -846,16 +437,39 @@ fun CreateScreen(navController: NavController, onNavigateBack: () -> Unit) {
             OutlinedTextField(
                 value = descripcion,
                 onValueChange = { descripcion = it },
-                label = { Text("¿Qué estás pensando?") },
-                modifier = Modifier.fillMaxWidth().height(100.dp)
+                label = { Text("Cuéntanos algo...") },
+                modifier = Modifier.fillMaxWidth().height(120.dp)
             )
 
             Spacer(Modifier.height(16.dp))
 
-            Button(onClick = { galleryLauncher.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Filled.Add, null)
-                Spacer(Modifier.width(8.dp))
-                Text("Agregar Imagen")
+            // Botones de Foto
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { galleryLauncher.launch("image/*") },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = PurpleLight, contentColor = PurpleDark)
+                ) {
+                    Icon(Icons.Filled.Menu, null) // Icono genérico de galería
+                    Spacer(Modifier.width(8.dp))
+                    Text("Galería")
+                }
+
+                Button(
+                    onClick = {
+                        // Creamos un archivo temporal y lanzamos la cámara
+                        val tempFile = imageManager.createTempImageFile()
+                        val uri = imageManager.getUriForFile(tempFile)
+                        tempCameraUri = uri
+                        cameraLauncher.launch(uri)
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = PurpleLight)
+                ) {
+                    Icon(Icons.Filled.AddCircle, null) // Icono genérico de cámara
+                    Spacer(Modifier.width(8.dp))
+                    Text("Cámara")
+                }
             }
 
             imageUri?.let { uri ->
@@ -863,93 +477,429 @@ fun CreateScreen(navController: NavController, onNavigateBack: () -> Unit) {
                 AsyncImage(
                     model = uri,
                     contentDescription = null,
-                    modifier = Modifier.fillMaxWidth().height(200.dp).clip(RoundedCornerShape(12.dp)),
+                    modifier = Modifier.fillMaxWidth().height(200.dp).clip(RoundedCornerShape(12.dp)).border(2.dp, PurplePrimary, RoundedCornerShape(12.dp)),
                     contentScale = ContentScale.Crop
                 )
             }
 
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(35.dp))
 
             Button(
                 onClick = {
                     scope.launch {
                         repository.savePublication(Publication(titulo, descripcion, imageUri?.toString()))
+                        Toast.makeText(context, "Publicado con éxito", Toast.LENGTH_SHORT).show()
                         onNavigateBack()
                     }
                 },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(50.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = PurplePrimary),
                 enabled = titulo.isNotBlank() && descripcion.isNotBlank()
             ) {
-                Text("PUBLICAR")
+                Text("PUBLICAR", fontWeight = FontWeight.Bold, fontSize = 16.sp)
             }
         }
     }
 }
 
-// =======================================
-// ========= PANTALLA BÚSQUEDA ===========
-// =======================================
+// ================= PANTALLA CONFIGURACIÓN (CON MODO OSCURO GLOBAL) =================
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ConfiguracionScreen(navController: NavController, settingsRepo: SettingsRepository) {
+    // Leemos el estado global
+    val isDarkMode by settingsRepo.isDarkMode.collectAsState(initial = false)
+    val scope = rememberCoroutineScope()
+
+    var notificationsEnabled by remember { mutableStateOf(true) }
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Configuración") },
+                navigationIcon = {
+                    IconButton(onClick = { navController.popBackStack() }) { Icon(Icons.Filled.ArrowBack, "Volver") }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier.fillMaxSize().padding(innerPadding).padding(16.dp)
+        ) {
+            // Switch Modo Oscuro
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("Modo Oscuro", style = MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.weight(1f))
+                Switch(
+                    checked = isDarkMode,
+                    onCheckedChange = { newValue ->
+                        scope.launch { settingsRepo.setDarkMode(newValue) }
+                    },
+                    colors = SwitchDefaults.colors(checkedThumbColor = PurplePrimary)
+                )
+            }
+
+            HorizontalDivider(Modifier.padding(vertical = 12.dp))
+
+            // Switch Notificaciones (Simulado)
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("Notificaciones", style = MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.weight(1f))
+                Switch(checked = notificationsEnabled, onCheckedChange = { notificationsEnabled = it })
+            }
+
+            Spacer(Modifier.weight(1f))
+            Text("Versión 1.0 - Milenium App", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+        }
+    }
+}
+
+// ================= COMPONENTES VISUALES =================
+
+@Composable
+fun PublicationCardModern(publication: Publication, onDelete: () -> Unit, onLike: (Boolean) -> Unit) {
+    val context = LocalContext.current
+    val imageManager = remember { ImageManager(context) }
+    val displayUri = remember(publication.imageUri) { imageManager.getDisplayableUri(publication.imageUri) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(2.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(modifier = Modifier.size(40.dp), shape = CircleShape, color = PurpleLight) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text("M", fontWeight = FontWeight.Bold, color = PurpleDark)
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Estudiante Milenium", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Text(formatDate(publication.timestamp), fontSize = 12.sp, color = Color.Gray)
+                }
+                IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, "Borrar", tint = Color.Gray) }
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(publication.titulo, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = PurplePrimary)
+            Text(publication.descripcion, color = MaterialTheme.colorScheme.onSurface)
+
+            displayUri?.let {
+                Spacer(Modifier.height(12.dp))
+                AsyncImage(model = it, contentDescription = null, modifier = Modifier.fillMaxWidth().height(250.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
+            }
+
+            Row(Modifier.padding(top = 12.dp)) {
+                Icon(
+                    if (publication.isLiked) Icons.Filled.Favorite else Icons.Outlined.Favorite,
+                    contentDescription = null,
+                    tint = if (publication.isLiked) Color.Red else Color.Gray,
+                    modifier = Modifier.clickable { onLike(!publication.isLiked) }
+                )
+                Spacer(Modifier.width(4.dp))
+                Text("${publication.likes}", color = Color.Gray)
+            }
+        }
+    }
+}
+
+// Utility Date Formatter
+private fun formatDate(timestamp: Long): String {
+    val sdf = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+    return sdf.format(Date(timestamp))
+}
+
+// ================= OTRAS PANTALLAS (Simplificadas para espacio) =================
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SearchScreen(onNavigateBack: () -> Unit) {
     val context = LocalContext.current
     val repository = remember { PublicationRepository(context) }
     val publications by repository.getAllPublications().collectAsState(initial = emptyList())
-
     var query by remember { mutableStateOf("") }
     var result by remember { mutableStateOf(SearchResult(emptyList(), emptyList())) }
 
-    // Cada vez que escribes, busca automáticamente
-    LaunchedEffect(query) {
-        result = repository.searchAllContent(query, publications)
+    LaunchedEffect(query) { result = repository.searchAllContent(query, publications) }
+
+    Scaffold(topBar = { CenterAlignedTopAppBar(title = { Text("Buscar") }, navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.Filled.ArrowBack, "") } }) }) { p ->
+        Column(Modifier.padding(p).padding(16.dp)) {
+            OutlinedTextField(value = query, onValueChange = { query = it }, label = { Text("Buscar...") }, modifier = Modifier.fillMaxWidth(), leadingIcon = { Icon(Icons.Filled.Search, "") })
+            LazyColumn(Modifier.padding(top = 16.dp)) {
+                if(result.users.isNotEmpty()) {
+                    item { Text("Usuarios", fontWeight = FontWeight.Bold, color = PurplePrimary) }
+                    items(result.users) { u -> Text("• ${u.nombre}", Modifier.padding(8.dp)) }
+                }
+                if(result.publications.isNotEmpty()) {
+                    item { Text("Posts", fontWeight = FontWeight.Bold, color = PurplePrimary) }
+                    items(result.publications) { p -> Text("• ${p.titulo}", Modifier.padding(8.dp)) }
+                }
+            }
+        }
+    }
+}
+
+// =======================================
+// ========= PANTALLA DE PERFIL ==========
+// =======================================
+@Composable
+fun SimpleProfileScreen(onBack: () -> Unit) {
+    // Datos falsos adaptados a la nueva estructura
+    val publications = remember {
+        mutableStateListOf(
+            Publication(
+                titulo = "Mi Graduación",
+                descripcion = "Un día inolvidable en el Centro Universitario Milenium. ¡Gracias a todos!",
+                timestamp = System.currentTimeMillis() - 86400000 // Hace 1 día
+            ),
+            Publication(
+                titulo = "Proyecto Final",
+                descripcion = "Presentando nuestro proyecto de Inteligencia Artificial.",
+                timestamp = System.currentTimeMillis() - 172800000 // Hace 2 días
+            )
+        )
     }
 
+    Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        // Cabecera con degradado Morado
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(PurplePrimary, PurpleDark)
+                    )
+                )
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.Filled.ArrowBack, "Atrás", tint = Color.White)
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Rafael Osorio", fontWeight = FontWeight.Bold, fontSize = 28.sp, color = Color.White)
+                        Text("@pantera_osorio", fontSize = 14.sp, color = PurpleLight)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Ing. Sistemas Informáticos\nInteligencia Artificial",
+                            fontSize = 14.sp,
+                            color = Color.White.copy(alpha = 0.8f),
+                            lineHeight = 18.sp
+                        )
+                    }
+
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            modifier = Modifier.size(90.dp),
+                            shape = CircleShape,
+                            color = Whiteish,
+                            border = BorderStroke(2.dp, PurpleLight)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text("R", fontSize = 40.sp, fontWeight = FontWeight.Bold, color = PurplePrimary)
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text("${publications.size}", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
+                        Text("Posts", fontSize = 12.sp, color = PurpleLight)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+
+        // Lista de publicaciones del perfil
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Text("MIS PUBLICACIONES", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = PurplePrimary)
+                Divider(color = PurpleLight, thickness = 1.dp, modifier = Modifier.padding(vertical = 8.dp))
+            }
+
+            items(publications) { publication ->
+                PublicationCardModern(
+                    publication = publication,
+                    onDelete = { publications.remove(publication) },
+                    onLike = { liked ->
+                        val index = publications.indexOf(publication)
+                        if (index != -1) publications[index] = publication.copy(isLiked = liked)
+                    }
+                )
+            }
+        }
+    }
+}
+
+// =======================================
+// ====== PANTALLA DE NOTIFICACIONES =====
+// =======================================
+@Composable
+fun NotificationScreenStyle(onBack: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+    ) {
+        // Top Bar personalizada
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, "Atrás", tint = MaterialTheme.colorScheme.onBackground)
+            }
+            Text("Notificaciones", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+            Icon(Icons.Filled.Search, "Buscar", tint = MaterialTheme.colorScheme.onBackground)
+        }
+
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            items(5) { index ->
+                NotificationItemStyle(index)
+            }
+        }
+    }
+}
+
+@Composable
+fun NotificationItemStyle(index: Int) {
+    val names = listOf("Pedro", "Ana López", "Milenium Oficial", "Carlos", "Sofía")
+    val actions = listOf("Le dio me gusta a tu foto", "Comentó tu publicación", "Publicó un nuevo aviso", "Te comenzó a seguir", "Compartió tu historia")
+    val times = listOf("2 min", "15 min", "1 h", "3 h", "1 d")
+    val isLike = index == 0 || index == 2
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { }
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(modifier = Modifier.size(48.dp), shape = CircleShape, color = PurpleLight) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(names[index].first().toString(), fontWeight = FontWeight.Bold, color = PurpleDark)
+            }
+        }
+
+        Spacer(modifier = Modifier.width(16.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = names[index],
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (isLike) {
+                    Icon(
+                        imageVector = Icons.Filled.Favorite,
+                        contentDescription = null,
+                        tint = PurplePrimary,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
+                Text(
+                    text = actions[index],
+                    color = Color.Gray,
+                    fontSize = 13.sp,
+                    maxLines = 1
+                )
+            }
+        }
+
+        Text(
+            text = times[index],
+            color = PurplePrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), color = Color.LightGray.copy(alpha = 0.3f))
+}
+
+// =======================================
+// ====== PANTALLA DE CONTÁCTANOS ========
+// =======================================
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ContactanosScreen(navController: NavController) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
-                title = { Text("Buscar") },
-                navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.Filled.ArrowBack, "Volver") } }
+                title = { Text("Contáctanos") },
+                navigationIcon = {
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(Icons.Filled.ArrowBack, "Volver")
+                    }
+                }
             )
         }
-    ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp)) {
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                label = { Text("Buscar usuarios o posts...") },
-                modifier = Modifier.fillMaxWidth(),
-                leadingIcon = { Icon(Icons.Filled.Search, null) }
-            )
-
-            LazyColumn(modifier = Modifier.padding(top = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (result.users.isNotEmpty()) {
-                    item { Text("Usuarios encontrados", fontWeight = FontWeight.Bold) }
-                    items(result.users) { user ->
-                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Surface(shape = CircleShape, color = Color.Gray, modifier = Modifier.size(40.dp)) {}
-                                Spacer(Modifier.width(16.dp))
-                                Column {
-                                    Text(user.nombre, fontWeight = FontWeight.Bold)
-                                    Text(user.profesion, style = MaterialTheme.typography.bodySmall)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (result.publications.isNotEmpty()) {
-                    item { Spacer(Modifier.height(16.dp)); Text("Publicaciones encontradas", fontWeight = FontWeight.Bold) }
-                    items(result.publications) { pub ->
-                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                            Column(Modifier.padding(16.dp)) {
-                                Text(pub.titulo, fontWeight = FontWeight.Bold)
-                                Text(pub.descripcion, maxLines = 1)
-                            }
-                        }
-                    }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Tarjeta de cabecera
+            Card(
+                colors = CardDefaults.cardColors(containerColor = PurplePrimary),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp).fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(Icons.Filled.Face, null, modifier = Modifier.size(60.dp), tint = Color.White)
+                    Spacer(Modifier.height(16.dp))
+                    Text("Centro Universitario Milenium", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.White)
+                    Text("Estamos para servirte", color = PurpleLight)
                 }
             }
+
+            Text("Medios de contacto", fontWeight = FontWeight.Bold, color = PurplePrimary, modifier = Modifier.padding(top = 8.dp))
+
+            ContactItem(Icons.Filled.Phone, "01 (238) 688 31 32")
+            ContactItem(Icons.Filled.CheckCircle, "01 (238) 104 80 04")
+            ContactItem(Icons.Filled.LocationOn, "Reforma Norte #444 Col. Centro\nC.P. 75700")
+            ContactItem(Icons.Filled.Email, "admisiones@unimilenium.edu.mx")
+            ContactItem(Icons.Filled.Share, "unimilenium (Facebook/Instagram)")
+        }
+    }
+}
+
+@Composable
+fun ContactItem(icon: ImageVector, text: String) {
+    Card(
+        elevation = CardDefaults.cardElevation(2.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Surface(shape = CircleShape, color = PurpleLight, modifier = Modifier.size(40.dp)) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(imageVector = icon, contentDescription = null, tint = PurpleDark)
+                }
+            }
+            Spacer(Modifier.width(16.dp))
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
         }
     }
 }
